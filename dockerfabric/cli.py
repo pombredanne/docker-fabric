@@ -4,12 +4,187 @@ from __future__ import unicode_literals
 import os
 import posixpath
 
-from fabric.api import cd, get, run, sudo
+from fabric.api import cd, env, fastprint, get, put, run, settings, sudo
 from fabric.network import needs_host
 
+from dockermap.api import USE_HC_MERGE
+from dockermap.client.cli import (DockerCommandLineOutput, parse_containers_output, parse_inspect_output,
+                                  parse_images_output)
+from dockermap.client.docker_util import DockerUtilityMixin
 from dockermap.shortcuts import chmod, chown, targz, mkdir
+
+from .base import DockerConnectionDict, FabricContainerClient, FabricClientConfiguration
 from .utils.containers import temp_container
 from .utils.files import temp_dir, is_directory
+
+
+class DockerCliClient(DockerUtilityMixin):
+    def __init__(self, cmd_prefix=None, default_bin='docker', base_url=None, tls=None, use_sudo=False):
+        super(DockerCliClient, self).__init__()
+        if base_url:
+            cmd_args = ['-H {0}'.format(base_url)]
+        else:
+            cmd_args = []
+        if tls:
+            cmd_args.append('--tls')
+        self._out = DockerCommandLineOutput(cmd_prefix, default_bin, cmd_args or None)
+        if use_sudo:
+            self._call_method = sudo
+        else:
+            self._call_method = run
+
+    def _call(self, cmd, quiet=False):
+        if cmd:
+            return self._call_method(cmd, shell=False, quiet=quiet)
+        return None
+
+    def create_container(self, *args, **kwargs):
+        cmd_str = self._out.get_cmd('create_container', *args, **kwargs)
+        return {'Id': self._call(cmd_str)}
+
+    def start(self, *args, **kwargs):
+        cmd_str = self._out.get_cmd('start', *args, **kwargs)
+        self._call(cmd_str)
+
+    def restart(self, *args, **kwargs):
+        cmd_str = self._out.get_cmd('restart', *args, **kwargs)
+        self._call(cmd_str)
+
+    def stop(self, *args, **kwargs):
+        cmd_str = self._out.get_cmd('stop', *args, **kwargs)
+        self._call(cmd_str)
+
+    def remove_container(self, *args, **kwargs):
+        cmd_str = self._out.get_cmd('remove_container', *args, **kwargs)
+        self._call(cmd_str)
+
+    def remove_image(self, *args, **kwargs):
+        cmd_str = self._out.get_cmd('remove_image', *args, **kwargs)
+        self._call(cmd_str)
+
+    def kill(self, *args, **kwargs):
+        cmd_str = self._out.get_cmd('kill', *args, **kwargs)
+        self._call(cmd_str)
+
+    def wait(self, *args, **kwargs):
+        cmd_str = self._out.get_cmd('wait', *args, **kwargs)
+        self._call(cmd_str)
+
+    def containers(self, *args, **kwargs):
+        cmd_str = self._out.get_cmd('containers', *args, **kwargs)
+        res = self._call(cmd_str, quiet=True)
+        return parse_containers_output(res)
+
+    def inspect_container(self, *args, **kwargs):
+        cmd_str = self._out.get_cmd('inspect_container', *args, **kwargs)
+        res = self._call(cmd_str, quiet=True)
+        return parse_inspect_output(res)
+
+    def images(self, *args, **kwargs):
+        cmd_str = self._out.get_cmd('images', *args, **kwargs)
+        res = self._call(cmd_str, quiet=True)
+        return parse_images_output(res)
+
+    def pull(self, repository, tag=None, **kwargs):
+        repo_tag = '{0}:{1}'.format(repository, tag) if tag else repository
+        cmd_str = self._out.get_cmd('pull', repo_tag, **kwargs)
+        self._call(cmd_str)
+
+    def push(self, repository, tag=None, **kwargs):
+        repo_tag = '{0}:{1}'.format(repository, tag) if tag else repository
+        cmd_str = self._out.get_cmd('push', repo_tag, **kwargs)
+        self._call(cmd_str)
+
+    def exec_create(self, *args, **kwargs):
+        cmd_str = self._out.get_cmd('exec_create', *args, **kwargs)
+        self._call(cmd_str)
+
+    def exec_start(self, *args, **kwargs):
+        cmd_str = self._out.get_cmd('exec_start', *args, **kwargs)
+        self._call(cmd_str)
+
+    def tag(self, image, repository, tag=None, **kwargs):
+        if tag:
+            repo_tag = '{0}:{1}'.format(repository, tag)
+        else:
+            repo_tag = repository
+        cmd_str = self._out.get_cmd('tag', image, repo_tag, **kwargs)
+        return self._call(cmd_str)
+
+    def logs(self, *args, **kwargs):
+        kwargs.pop('stream', None)
+        cmd_str = self._out.get_cmd('logs', *args, **kwargs)
+        return self._call(cmd_str, quiet=True)
+
+    def login(self, **kwargs):
+        for key, variable in [
+            ('username', 'user'),
+            ('password', 'password'),
+            ('email', 'mail'),
+            ('registry', 'repository'),
+            ('insecure_registry', 'insecure')
+        ]:
+            if key not in kwargs:
+                env_value = env.get('docker_registry_{0}'.format(variable))
+                if env_value:
+                    kwargs[key] = env_value
+        registry = kwargs.pop('registry', env.get('docker_registry_repository'))
+        if registry:
+            cmd_str = self._out.get_cmd('login', registry, **kwargs)
+        else:
+            cmd_str = self._out.get_cmd('login', **kwargs)
+        res = self._call(cmd_str, quiet=True)
+        lines = res.splitlines()
+        fastprint(lines)
+        return 'Login Succeeded' in lines
+
+    def build(self, tag, add_latest_tag=False, add_tags=None, raise_on_error=False, **kwargs):
+        try:
+            context = kwargs.pop('fileobj')
+        except KeyError:
+            raise ValueError("'fileobj' needs to be provided. Using 'path' is currently not implemented.")
+        for a in ['custom_context', 'encoding']:
+            kwargs.pop(a, None)
+
+        with temp_dir() as remote_tmp:
+            remote_fn = posixpath.join(remote_tmp, 'context')
+            put(context, remote_fn)
+            cmd_str = self._out.get_cmd('build', '- <', remote_fn, tag=tag, **kwargs)
+            with settings(warn_only=not raise_on_error):
+                res = self._call(cmd_str)
+        if res:
+            last_log = res.splitlines()[-1]
+            if last_log and last_log.startswith('Successfully built '):
+                image_id = last_log[19:]  # Remove prefix
+                self.add_extra_tags(image_id, tag, add_tags, add_latest_tag)
+                return image_id
+        return None
+
+    def push_log(self, info, level, *args, **kwargs):
+        pass
+
+
+class DockerCliConnections(DockerConnectionDict):
+    client_class = DockerCliClient
+
+
+docker_cli = DockerCliConnections().get_connection
+
+
+class DockerCliConfig(FabricClientConfiguration):
+    init_kwargs = 'base_url', 'tls', 'cmd_prefix', 'default_bin', 'use_sudo'
+    client_constructor = docker_cli
+
+    def update_settings(self, **kwargs):
+        super(DockerCliConfig, self).update_settings(**kwargs)
+        self.use_host_config = USE_HC_MERGE
+
+
+class ContainerCliFabricClient(FabricContainerClient):
+    configuration_class = DockerCliConfig
+
+
+container_cli = ContainerCliFabricClient
 
 
 @needs_host

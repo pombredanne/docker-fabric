@@ -11,7 +11,7 @@ import six
 from dockermap.shortcuts import curl, untargz
 from dockermap.utils import expand_path
 from . import DEFAULT_SOCAT_VERSION, cli
-from .apiclient import docker_fabric
+from .api import docker_fabric
 from .utils.files import temp_dir
 from .utils.net import get_ip4_address, get_ip6_address
 from .utils.output import stdout_result
@@ -63,24 +63,46 @@ def _format_output_table(data_dict, columns, full_ids=False, full_cmd=False, sho
 
 
 @task
-def install_docker():
+def install_docker_ubuntu(skip_group_assignment=False):
     """
-    Installs Docker on a remote machine and adds the current user to the `docker` user group.
+    Installs Docker on a remote machine running Ubuntu and adds the current user to the ``docker`` user group.
+
+    :param skip_group_assignment: If set to ``True``, skips the assignment to the ``docker`` group.
+    :type skip_group_assignment: bool
     """
-    sudo('apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 36A1D7869245C8950F966E92D8576A8BA88D21E9')
-    sudo('echo deb https://get.docker.io/ubuntu docker main > /etc/apt/sources.list.d/docker.list')
-    sudo('apt-get update')
-    sudo('apt-get -y install lxc-docker')
-    assign_user_groups(env.user, ['docker'])
+    sudo('apt-key adv --keyserver hkp://p80.pool.sks-keyservers.net:80 '
+         '--recv-keys 58118E89F3A912897C070ADBF76221572C52609D')
+    sudo('echo deb https://apt.dockerproject.org/repo ubuntu-`lsb_release -c -s` main > '
+         '/etc/apt/sources.list.d/docker.list')
+    sudo('apt-get update -o Dir::Etc::sourcelist="sources.list.d/docker.list" -o Dir::Etc::sourceparts="-" '
+         '-o APT::Get::List-Cleanup="0"')
+    sudo('apt-get -y install docker-engine')
+    if not skip_group_assignment:
+        assign_user_groups(env.user, ['docker'])
 
 
 @task
-def build_socat():
+def install_docker_centos(skip_group_assignment=False):
     """
-    Downloads and installs the tool `socat` from source.
+    Installs Docker on a remote machine running CentOS and adds the current user to the ``docker`` user group.
+
+    :param skip_group_assignment: If set to ``True``, skips the assignment to the ``docker`` group.
+    :type skip_group_assignment: bool
     """
-    sudo('apt-get update')
-    sudo('apt-get -y install gcc make')
+    sudo("tee /etc/yum.repos.d/docker.repo <<-'EOF'\n"
+         "[dockerrepo]\n"
+         "name=Docker Repository\n"
+         "baseurl=https://yum.dockerproject.org/repo/main/centos/$releasever/\n"
+         "enabled=1\n"
+         "gpgcheck=1\n"
+         "gpgkey=https://yum.dockerproject.org/gpg\n"
+         "EOF\n")
+    sudo('yum install -y docker-engine')
+    if not skip_group_assignment:
+        assign_user_groups(env.user, ['docker'])
+
+
+def _build_socat():
     with temp_dir() as remote_tmp:
         socat_version = env.get('socat_version', DEFAULT_SOCAT_VERSION)
         src_dir = '{0}/socat-{1}'.format(remote_tmp, socat_version)
@@ -91,6 +113,25 @@ def build_socat():
             run('./configure')
             run('make')
             sudo('make install')
+
+
+@task
+def build_socat_ubuntu():
+    """
+    Downloads and installs the tool `socat` from source on Ubuntu.
+    """
+    sudo('apt-get update')
+    sudo('apt-get -y install gcc make')
+    _build_socat()
+
+
+@task
+def build_socat_centos():
+    """
+    Downloads and installs the tool `socat` from source on CentOS.
+    """
+    sudo('yum install -y gcc make')
+    _build_socat()
 
 
 @task
@@ -204,19 +245,19 @@ def list_containers(list_all=True, short_image=True, full_ids=False, full_cmd=Fa
     :type short_image: bool
     :param full_ids: Shows the full image ids. When ``False`` (default) only shows the first 12 characters.
     :type full_ids: bool
-    :param full_ids: Shows the full container command. When ``False`` (default) only shows the first 25 characters.
-    :type full_ids: bool
+    :param full_cmd: Shows the full container command. When ``False`` (default) only shows the first 25 characters.
+    :type full_cmd: bool
     """
     containers = docker_fabric().containers(all=list_all)
     _format_output_table(containers, CONTAINER_COLUMNS, full_ids, full_cmd, short_image)
 
 
 @task
-def cleanup_containers():
+def cleanup_containers(include_initial=False):
     """
     Removes all containers that have finished running.
     """
-    docker_fabric().cleanup_containers()
+    docker_fabric().cleanup_containers(include_initial=include_initial)
 
 
 @task
@@ -227,7 +268,8 @@ def cleanup_images(remove_old=False):
     :param remove_old: Also remove images that do have a name, but no `latest` tag.
     :type remove_old: bool
     """
-    docker_fabric().cleanup_images(remove_old)
+    keep_tags = env.get('docker_keep_tags')
+    docker_fabric().cleanup_images(remove_old=remove_old, keep_tags=keep_tags)
 
 
 @task
